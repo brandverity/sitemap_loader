@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+
+import argparse
+import tldextract
+import sys
+import re
+from lxml import etree
+from urllib.request import build_opener, HTTPRedirectHandler, Request
+from urllib.parse import urlparse
+from urllib.error import URLError, HTTPError
+from http.client import HTTPException
+
+ROBOT_SITEMAP_PATTERN = re.compile('Sitemap:[\s]*(.*)')
+
+class LimitedRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, no_external_redirects=False):
+        super().__init__()
+        self._no_external_redirects = no_external_redirects
+        self._extract = tldextract.TLDExtract(cache_file=False)
+
+    def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+        if self._no_external_redirects:
+            src = self._extract(req.full_url)
+            dest = self._extract(newurl)
+            if src.domain != dest.domain:
+                print("%s redirects to %s" % (src.domain, dest.domain), file=sys.stderr)
+                return None
+        return HTTPRedirectHandler.redirect_request(self, req, fp, code, msg, hdrs, newurl)
+
+def _retrieve_one(opener, urls, agent):
+    error = None
+    for url in urls:
+        try:
+            request = Request(url)
+            request.add_header('User-Agent', agent)
+            return opener.open(request)
+        except HTTPError as e:
+            if e.code == 404:
+                error = e
+                continue
+            return e
+        except URLError as e:
+            return e
+        except HTTPException as e:
+            return e
+    return error
+
+def main():
+    parser = argparse.ArgumentParser(description='Download sitemaps from sites and extract urls')
+    parser.add_argument('domains', metavar='DOMAIN', nargs='*', help='a domain to check')
+    parser.add_argument('--domain_list', '-f', default=None, help='file containing domain list')
+    parser.add_argument('--user-agent', '-a', default='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.86 Safari/537.36', help='UserAgent to send with requests')
+    args = parser.parse_args()
+
+    domains = set()
+    if args.domain_list:
+        with open(args.domain_list) as f:
+            domains.update([l.strip() for l in f if l.strip()])
+
+    if args.domains:
+        domains.update(args.domains)
+
+    if not domains:
+        raise ValueError('You must supply domains as arguments or in a file specified by --domain_list')
+    
+    opener = build_opener(LimitedRedirectHandler(True))
+    sitemap_urls = {}
+    for domain in domains:
+        urls = ['%s://%s/robots.txt' % (scheme, domain) for scheme in ['http', 'https']]
+        result = _retrieve_one(opener, urls, args.user_agent)
+        if not isinstance(result, URLError):
+            match = ROBOT_SITEMAP_PATTERN.search(result.read().decode('utf-8'))
+            if match:
+                sitemap_urls[domain] = [match.groups()[0]]
+    for domain in domains.difference(sitemap_urls.keys()):
+        sitemap_urls[domain] = ['%s://%s/sitemap.xml' % (scheme, domain) for scheme in ['http', 'https']]
+    sitemap_urls = list(sitemap_urls.values())
+
+    while sitemap_urls:
+        urls = sitemap_urls.pop()
+        result = _retrieve_one(opener, urls, args.user_agent)
+        if isinstance(result, URLError):
+            print(urls[0], result, file=sys.stderr)
+        else:
+            try:
+                dom = etree.parse(result)
+                for url in dom.xpath('//*[local-name() = "url"]/*[local-name() = "loc"]/text()'):
+                    print(url)
+                sitemap_urls.extend([[u] for u in dom.xpath('//*[local-name() = "sitemapindex"]/*[local-name() = "sitemap"]/*[local-name() = "loc"]/text()')])
+            except Exception as e:
+                print(urls[0], e, file=sys.stderr)
+
+if __name__ == "__main__":
+    main()
